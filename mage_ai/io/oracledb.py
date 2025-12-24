@@ -1,5 +1,5 @@
 import warnings
-from typing import IO, Any, List, Union
+from typing import IO, Any, Dict, List, Union
 
 import numpy as np
 import oracledb
@@ -8,6 +8,7 @@ from pandas import DataFrame, Series, read_sql
 
 from mage_ai.io.base import QUERY_ROW_LIMIT, ExportWritePolicy
 from mage_ai.io.config import BaseConfigLoader, ConfigKey
+from mage_ai.io.constants import UNIQUE_CONFLICT_METHOD_UPDATE
 from mage_ai.io.export_utils import PandasTypes
 from mage_ai.io.sql import BaseSQL
 from mage_ai.server.logger import Logger
@@ -189,15 +190,74 @@ FETCH FIRST {limit} ROWS ONLY
     def export(
         self,
         df: DataFrame,
+        schema_name: str = None,
         table_name: str = None,
-        if_exists: ExportWritePolicy = ExportWritePolicy.REPLACE,
+        if_exists: Union[str, ExportWritePolicy] = ExportWritePolicy.REPLACE,
+        unique_conflict_method: str = None,
+        unique_constraints: List[str] = None,
         **kwargs,
     ) -> None:
+        """
+        Exports a data frame to OracleDB. If table doesn't exist, 
+        the table is automatically created. Supports insert, append, and upsert operations.
+        
+        Args:
+            df (DataFrame): Data frame to export
+            schema_name (str): Schema name (owner in Oracle). Defaults to current user
+            table_name (str): Name of the table to export to
+            if_exists (Union[str, ExportWritePolicy]): Policy if table exists:
+                - 'fail' or ExportWritePolicy.FAIL: Raise error if table exists
+                - 'replace' or ExportWritePolicy.REPLACE: Drop and recreate table (default)
+                - 'append' or ExportWritePolicy.APPEND: Insert new rows (for upsert use unique_conflict_method)
+            unique_conflict_method (str): Method to handle conflicts when appending:
+                - 'update': Use MERGE statement to update matching rows (upsert)
+            unique_constraints (List[str]): Columns that form the unique key for upsert matching
+            **kwargs: Additional parameters passed to BaseSQL.export()
+        
+        Supported Operations:
+            1. INSERT (if_exists='replace'): Create new table or replace existing one
+            2. APPEND (if_exists='append'): Add new rows to existing table
+            3. UPSERT (if_exists='append' + unique_conflict_method='update'): Insert or update rows based on unique_constraints
+        
+        Example:
+            # Simple insert
+            oracle.export(df, table_name='my_table', if_exists='replace')
+            
+            # Append to existing table
+            oracle.export(df, table_name='my_table', if_exists='append')
+            
+            # Upsert (insert or update based on id)
+            oracle.export(df, table_name='my_table', if_exists='append',
+                         unique_conflict_method='update', unique_constraints=['id'])
+        """
+        if table_name is None:
+            raise Exception('Please provide a table_name argument in the export method.')
+        
+        # Convert string if_exists to ExportWritePolicy enum if needed
+        if isinstance(if_exists, str):
+            if_exists_lower = if_exists.lower()
+            if if_exists_lower == 'fail':
+                if_exists = ExportWritePolicy.FAIL
+            elif if_exists_lower == 'replace':
+                if_exists = ExportWritePolicy.REPLACE
+            elif if_exists_lower == 'append':
+                if_exists = ExportWritePolicy.APPEND
+            else:
+                if_exists = ExportWritePolicy.REPLACE
+        
+        # When upsert is needed, force APPEND mode
+        if unique_conflict_method and unique_constraints:
+            if_exists = ExportWritePolicy.APPEND
+        
+        # Call parent export with all parameters
         super().export(
             df,
             **kwargs,
+            schema_name=schema_name,
             table_name=table_name,
             if_exists=if_exists,
+            unique_conflict_method=unique_conflict_method,
+            unique_constraints=unique_constraints,
             # Oracle cursor execute will automatically add a semicolon at the end of the query.
             skip_semicolon_at_end=True
         )
@@ -255,3 +315,115 @@ FETCH FIRST {limit} ROWS ONLY
 
         insert_sql = f'INSERT INTO {full_table_name} VALUES({values_placeholder.rstrip(",")})'
         cursor.executemany(insert_sql, values)
+
+    def upload_dataframe_fast(
+        self,
+        df: DataFrame,
+        schema_name: str,
+        table_name: str,
+        if_exists: ExportWritePolicy = None,
+        **kwargs,
+    ):
+        """
+        Uploads dataframe to Oracle database with support for upsert operations.
+        
+        Args:
+            df (DataFrame): Data frame to upload
+            schema_name (str): Schema name (owner in Oracle). Uses current user if None
+            table_name (str): Table name to upload to
+            if_exists (ExportWritePolicy): Policy if table exists:
+                - REPLACE: Delete existing data and insert new
+                - APPEND: Insert new rows only
+                - FAIL: Raise error if table exists
+            **kwargs: Additional parameters including:
+                - unique_conflict_method: 'update' for upsert
+                - unique_constraints: List of columns for matching in upsert
+        
+        Raises:
+            Exception: If data insertion fails, transaction is rolled back
+        """
+        unique_conflict_method = kwargs.get('unique_conflict_method')
+        unique_constraints = kwargs.get('unique_constraints')
+
+        full_table_name = f"{schema_name}.{table_name}" if schema_name else table_name
+
+        # Prepare dataframe
+        df_ = df.copy()
+        columns = list(df_.columns)
+        
+        # Early return if dataframe is empty
+        if df_.empty:
+            logger.info(f'DataFrame is empty, skipping upload to {full_table_name}')
+            return
+        
+        # Clean and prepare data for all columns
+        for col in columns:
+            dtype = df_[col].dtype
+            if dtype == PandasTypes.OBJECT:
+                df_[col] = df_[col].apply(
+                    lambda x: simplejson.dumps(x, default=encode_complex, ignore_nan=True)
+                    if type(x) in (dict, np.ndarray, list) else x
+                )
+            elif dtype in (PandasTypes.MIXED, PandasTypes.UNKNOWN_ARRAY, PandasTypes.COMPLEX):
+                df_[col] = df_[col].astype('string')
+            
+            # Remove extraneous surrounding double quotes
+            df_[col] = df_[col].apply(lambda x: x.strip('"') if x and isinstance(x, str) else x)
+        
+        df_.fillna('', inplace=True)
+        values = list(df_.itertuples(index=False, name=None))
+        
+        try:
+            # Handle upsert with MERGE statement
+            if unique_conflict_method and unique_constraints and if_exists == ExportWritePolicy.APPEND:
+                if UNIQUE_CONFLICT_METHOD_UPDATE == unique_conflict_method:
+                    with self.conn.cursor() as cur:
+                        # Build MERGE statement for upsert
+                        # Match rows based on unique_constraints, update all columns if matched, insert if not matched
+                        on_clause = ' AND '.join([f't.{col} = s.{col}' for col in unique_constraints])
+                        update_clause = ', '.join([f't.{col} = s.{col}' for col in columns])
+                        insert_cols = ', '.join(columns)
+                        insert_vals = ', '.join([f's.{col}' for col in columns])
+                        
+                        # Oracle MERGE requires column aliases in USING clause
+                        merge_sql = f"""
+MERGE INTO {full_table_name} t
+USING (SELECT {', '.join([f':{i+1} as {col}' for i, col in enumerate(columns)])} FROM DUAL) s
+ON ({on_clause})
+WHEN MATCHED THEN
+    UPDATE SET {update_clause}
+WHEN NOT MATCHED THEN
+    INSERT ({insert_cols}) VALUES ({insert_vals})
+                        """
+                        
+                        # Execute merge for each row
+                        row_count = 0
+                        for value_tuple in values:
+                            cur.execute(merge_sql, value_tuple)
+                            row_count += 1
+                        
+                        self.conn.commit()
+                        logger.info(f'Successfully UPSERTED {row_count} rows to {full_table_name}')
+                    return
+            
+            # Standard insert for REPLACE or regular APPEND (no upsert)
+            with self.conn.cursor() as cur:
+                # Create INSERT statement
+                values_placeholder = ', '.join([f':{i+1}' for i in range(len(columns))])
+                insert_sql = f'INSERT INTO {full_table_name} ({", ".join(columns)}) VALUES({values_placeholder})'
+                
+                # Execute insert
+                row_count = len(values)
+                cur.executemany(insert_sql, values)
+                self.conn.commit()
+                logger.info(f'Successfully INSERTED {row_count} rows to {full_table_name}')
+        
+        except Exception as e:
+            # Rollback on error to prevent partial inserts
+            try:
+                self.conn.rollback()
+                logger.error(f'Transaction rolled back due to error: {e}')
+            except Exception as rollback_error:
+                logger.error(f'Error during rollback: {rollback_error}')
+            
+            raise Exception(f'Failed to upload dataframe to {full_table_name}: {str(e)}')
