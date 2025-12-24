@@ -1,6 +1,6 @@
 import struct
 from datetime import datetime, timedelta, timezone
-from typing import IO, Any, List, Union
+from typing import IO, Any, Dict, List, Union
 
 import numpy as np
 import pyodbc
@@ -338,3 +338,108 @@ class MSSQL(BaseSQL):
         # MSSQL doesn't support WITH statements in subqueries, so if the user uses a WITH
         # statement in their query, it would break if we tried to enforce a limit.
         return query
+    
+    def export(
+        self,
+        df: DataFrame,
+        table_id: str = None,
+        if_exists: Union[str, ExportWritePolicy] = ExportWritePolicy.REPLACE,
+        overwrite_types: Dict = None,
+        query_string: Union[str, None] = None,
+        verbose: bool = True,
+        unique_conflict_method: str = None,
+        unique_constraints: List[str] = None,
+        **configuration_params,
+    ) -> None:
+        """
+        Exports a data frame to MSSQL database. If table doesn't exist, 
+        the table is automatically created. Supports upsert operations.
+
+        Args:
+            df (DataFrame): Data frame to export
+            table_id (str): ID of the table to export the data frame to.
+                Format: "schema.table_name"
+            if_exists (Union[str, ExportWritePolicy]): Specifies export policy if table exists. Either
+                - `'fail'` or ExportWritePolicy.FAIL: throw an error.
+                - `'replace'` or ExportWritePolicy.REPLACE: drops existing table and creates new table of same name.
+                - `'append'` or ExportWritePolicy.APPEND: appends data frame to existing table. In this case the schema must
+                                match the original table.
+                Defaults to ExportWritePolicy.REPLACE.
+            overwrite_types (Dict): The column types to be overwritten by users.
+            query_string (str): SQL query string to create table from
+            verbose (bool): If True, prints status messages
+            unique_conflict_method (str): Method to handle unique conflicts (e.g., 'update')
+            unique_constraints (List[str]): List of columns with unique constraints for upsert
+            **configuration_params: Additional configuration parameters
+        """
+        if table_id is None:
+            raise Exception('Please provide a table_id argument in the export method.')
+
+        if type(df) is dict:
+            df = DataFrame([df])
+        elif type(df) is list:
+            df = DataFrame(df)
+
+        # Convert string if_exists to ExportWritePolicy enum
+        if isinstance(if_exists, str):
+            if_exists_lower = if_exists.lower()
+            if if_exists_lower == 'fail':
+                if_exists = ExportWritePolicy.FAIL
+            elif if_exists_lower == 'replace':
+                if_exists = ExportWritePolicy.REPLACE
+            elif if_exists_lower == 'append':
+                if_exists = ExportWritePolicy.APPEND
+            else:
+                if_exists = ExportWritePolicy.REPLACE
+
+        def __process():
+            nonlocal if_exists
+            
+            parts = table_id.split('.')
+            if len(parts) == 2:
+                schema_name, table_name = parts
+            else:
+                schema_name = self.default_schema()
+                table_name = table_id
+
+            full_table_name = f'[{schema_name}].[{table_name}]'
+
+            # Check if table exists
+            table_exists_flag = self.table_exists(schema_name, table_name)
+
+            if query_string:
+                if if_exists == ExportWritePolicy.FAIL and table_exists_flag:
+                    raise ValueError(
+                        f'Table \'{full_table_name}\' already exists in database.',
+                    )
+
+                if if_exists == ExportWritePolicy.REPLACE and table_exists_flag:
+                    with self.conn.cursor() as cur:
+                        cur.execute(f'DROP TABLE {full_table_name}')
+                        self.conn.commit()
+                
+                with self.conn.cursor() as cur:
+                    create_command = f'CREATE TABLE {full_table_name} AS\n{query_string}'
+                    cur.execute(create_command)
+                    self.conn.commit()
+            else:
+                # Handle upsert when unique_conflict_method is specified
+                if unique_conflict_method and unique_constraints and table_exists_flag:
+                    if_exists = ExportWritePolicy.APPEND
+                
+                self.upload_dataframe_fast(
+                    df,
+                    schema_name=schema_name,
+                    table_name=table_name,
+                    if_exists=if_exists,
+                    unique_conflict_method=unique_conflict_method,
+                    unique_constraints=unique_constraints,
+                    **configuration_params,
+                )
+
+        if verbose:
+            with self.printer.print_msg(f'Exporting data to table \'{table_id}\''):
+                __process()
+        else:
+            __process()
+
